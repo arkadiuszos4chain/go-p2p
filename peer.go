@@ -18,6 +18,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/libsv/go-p2p/bsvutil"
 	"github.com/libsv/go-p2p/chaincfg/chainhash"
+	p2p_logger "github.com/libsv/go-p2p/logger"
 	"github.com/libsv/go-p2p/wire"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/go-utils/batcher"
@@ -64,7 +65,7 @@ type Peer struct {
 	peerHandler                   PeerHandlerI
 	writeChan                     chan wire.Message
 	pingPongAlive                 chan struct{}
-	logger                        *slog.Logger
+	logger                        *p2p_logger.ExtendedLogger
 	sentVerAck                    atomic.Bool
 	receivedVerAck                atomic.Bool
 	batchDelay                    time.Duration
@@ -95,12 +96,14 @@ type Peer struct {
 func NewPeer(logger *slog.Logger, address string, peerHandler PeerHandlerI, network wire.BitcoinNet, options ...PeerOptions) (*Peer, error) {
 	writeChan := make(chan wire.Message, 10000)
 
-	peerLogger := logger.With(
+	logger = logger.With(
 		slog.Group("peer",
 			slog.String("network", network.String()),
 			slog.String("address", address),
 		),
 	)
+
+	peerLogger := &p2p_logger.ExtendedLogger{*logger}
 
 	p := &Peer{
 		network:                       network,
@@ -446,11 +449,11 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 					if err = wire.WriteMessage(readConn, verackMsg, wire.ProtocolVersion, p.network); err != nil {
 						commandLogger.Error("failed to write message", slog.String(errKey, err.Error()))
 					}
-					commandLogger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(verackMsg.Command())))
+					commandLogger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(verackMsg.Command())))
 					p.sentVerAck.Store(true)
 
 				case wire.CmdPing:
-					commandLogger.Debug(receivedMsg, slog.String(commandKey, strings.ToUpper(wire.CmdPing)))
+					commandLogger.Trace(receivedMsg, slog.String(commandKey, strings.ToUpper(wire.CmdPing)))
 					p.pingPongAlive <- struct{}{}
 
 					pingMsg, ok := msg.(*wire.MsgPing)
@@ -465,10 +468,10 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 						continue
 					}
 					for _, inv := range invMsg.InvList {
-						commandLogger.Debug(receivedMsg, slog.String(hashKey, inv.Hash.String()), slog.String(typeKey, inv.Type.String()))
+						commandLogger.Trace(receivedMsg, slog.String(hashKey, inv.Hash.String()), slog.String(typeKey, inv.Type.String()))
 					}
 
-					go func(invList []*wire.InvVect, routineLogger *slog.Logger) {
+					go func(invList []*wire.InvVect, routineLogger *p2p_logger.ExtendedLogger) {
 						for _, invVect := range invList {
 							switch invVect.Type {
 							case wire.InvTypeTx:
@@ -489,7 +492,7 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 						continue
 					}
 					for _, inv := range dataMsg.InvList {
-						commandLogger.Debug(receivedMsg, slog.String(hashKey, inv.Hash.String()), slog.String(typeKey, inv.Type.String()))
+						commandLogger.Trace(receivedMsg, slog.String(hashKey, inv.Hash.String()), slog.String(typeKey, inv.Type.String()))
 					}
 					p.handleGetDataMsg(dataMsg, commandLogger)
 
@@ -498,7 +501,7 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 					if !ok {
 						continue
 					}
-					commandLogger.Debug(receivedMsg, slog.String(hashKey, txMsg.TxHash().String()), slog.Int("size", txMsg.SerializeSize()))
+					commandLogger.Trace(receivedMsg, slog.String(hashKey, txMsg.TxHash().String()), slog.Int("size", txMsg.SerializeSize()))
 					if err = p.peerHandler.HandleTransaction(txMsg, p); err != nil {
 						commandLogger.Error("Unable to process tx", slog.String(hashKey, txMsg.TxHash().String()), slog.String(errKey, err.Error()))
 					}
@@ -543,11 +546,11 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 					}
 
 				case wire.CmdVerAck:
-					commandLogger.Debug(receivedMsg)
+					commandLogger.Trace(receivedMsg)
 					p.receivedVerAck.Store(true)
 
 				case wire.CmdPong:
-					commandLogger.Debug(receivedMsg, slog.String(commandKey, strings.ToUpper(wire.CmdPong)))
+					commandLogger.Trace(receivedMsg, slog.String(commandKey, strings.ToUpper(wire.CmdPong)))
 					p.pingPongAlive <- struct{}{}
 
 				default:
@@ -558,17 +561,17 @@ func (p *Peer) startReadHandler(ctx context.Context) {
 	}()
 }
 
-func (p *Peer) handleGetDataMsg(dataMsg *wire.MsgGetData, logger *slog.Logger) {
+func (p *Peer) handleGetDataMsg(dataMsg *wire.MsgGetData, logger *p2p_logger.ExtendedLogger) {
 	txRequests := make([]*wire.InvVect, 0)
 
 	for _, invVect := range dataMsg.InvList {
 		switch invVect.Type {
 		case wire.InvTypeTx:
-			logger.Debug("Request for TX", slog.String(hashKey, invVect.Hash.String()))
+			logger.Trace("Request for TX", slog.String(hashKey, invVect.Hash.String()))
 			txRequests = append(txRequests, invVect)
 
 		case wire.InvTypeBlock:
-			logger.Info("Request for block", slog.String(hashKey, invVect.Hash.String()), slog.String(typeKey, invVect.Type.String()))
+			logger.Trace("Request for block", slog.String(hashKey, invVect.Hash.String()), slog.String(typeKey, invVect.Type.String()))
 			continue
 
 		default:
@@ -636,7 +639,7 @@ func (p *Peer) RequestBlock(blockHash *chainhash.Hash) {
 	if err := p.WriteMsg(dataMsg); err != nil {
 		p.logger.Error("failed to send GETDATA message", slog.String(hashKey, blockHash.String()), slog.String(typeKey, iv.Type.String()), slog.String(errKey, err.Error()))
 	} else {
-		p.logger.Debug("Sent GETDATA", slog.String(hashKey, blockHash.String()), slog.String(typeKey, iv.Type.String()))
+		p.logger.Trace("Sent GETDATA", slog.String(hashKey, blockHash.String()), slog.String(typeKey, iv.Type.String()))
 	}
 }
 
@@ -646,7 +649,7 @@ func (p *Peer) sendInvBatch(batch []*chainhash.Hash) {
 	for _, hash := range batch {
 		iv := wire.NewInvVect(wire.InvTypeTx, hash)
 		_ = invMsg.AddInvVect(iv)
-		p.logger.Debug("Sent INV", slog.String(hashKey, hash.String()), slog.String(typeKey, wire.InvTypeTx.String()))
+		p.logger.Trace("Sent INV", slog.String(hashKey, hash.String()), slog.String(typeKey, wire.InvTypeTx.String()))
 	}
 
 	p.writeChan <- invMsg
@@ -658,13 +661,13 @@ func (p *Peer) sendDataBatch(batch []*chainhash.Hash) {
 	for _, hash := range batch {
 		iv := wire.NewInvVect(wire.InvTypeTx, hash)
 		_ = dataMsg.AddInvVect(iv)
-		p.logger.Debug("Sent GETDATA", slog.String(hashKey, hash.String()), slog.String(typeKey, wire.InvTypeTx.String()))
+		p.logger.Trace("Sent GETDATA", slog.String(hashKey, hash.String()), slog.String(typeKey, wire.InvTypeTx.String()))
 	}
 
 	if err := p.WriteMsg(dataMsg); err != nil {
 		p.logger.Error("failed to send tx data message", slog.String(errKey, err.Error()))
 	} else {
-		p.logger.Debug("Sent GETDATA", slog.Int("items", len(batch)))
+		p.logger.Trace("Sent GETDATA", slog.Int("items", len(batch)))
 	}
 }
 
@@ -741,15 +744,15 @@ func (p *Peer) startWriteChannelHandler(ctx context.Context, instance int) {
 
 					switch m := message.(type) {
 					case *wire.MsgTx:
-						p.logger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.TxHash().String()), slog.String(typeKey, "tx"))
+						p.logger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.TxHash().String()), slog.String(typeKey, "tx"))
 					case *wire.MsgBlock:
-						p.logger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.BlockHash().String()), slog.String(typeKey, "block"))
+						p.logger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.BlockHash().String()), slog.String(typeKey, "block"))
 					case *wire.MsgGetData:
-						p.logger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.InvList[0].Hash.String()), slog.String(typeKey, "getdata"))
+						p.logger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.InvList[0].Hash.String()), slog.String(typeKey, "getdata"))
 					case *wire.MsgInv:
-						p.logger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.InvList[0].Hash.String()), slog.String(typeKey, "inv"))
+						p.logger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(hashKey, m.InvList[0].Hash.String()), slog.String(typeKey, "inv"))
 					default:
-						p.logger.Debug(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(typeKey, "unknown"))
+						p.logger.Trace(sentMsg, slog.String(commandKey, strings.ToUpper(message.Command())), slog.String(typeKey, "unknown"))
 					}
 				}(msg)
 			}
